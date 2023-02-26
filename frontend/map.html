@@ -1,0 +1,284 @@
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="initial-scale=1,maximum-scale=1,user-scalable=no">
+    <link href="https://api.mapbox.com/mapbox-gl-js/v2.13.0/mapbox-gl.css" rel="stylesheet">
+    <script src="https://api.mapbox.com/mapbox-gl-js/v2.13.0/mapbox-gl.js"></script>
+    <title>MapSocket</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+        }
+
+        #map {
+            position: absolute;
+            top: 0;
+            bottom: 0;
+            width: 100%;
+        }
+
+        #username-input {
+            width: 25%;
+            height: 30px;
+            
+        }
+
+        #set-username-btn {
+            height: 30px;
+        }
+
+        #overlay {
+            position: absolute;
+            margin: 10;
+            right: 0;
+            left: 0;
+        }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+    <div id="overlay">
+        <input type="text" id="username-input" placeholder="Username: " />
+        <button id="set-username-btn">Set</button>
+    </div>
+    <script>
+        const defaultFetchConfig = {
+            method: 'POST',
+            cache: 'no-cache',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            redirect: 'follow',
+            referrerPolicy: 'no-referrer',
+        };
+
+        const getUserLocation = async (owner) => {
+            return new Promise((res, rej) => {
+                navigator.geolocation.getCurrentPosition((loc) => {
+                    res(JSON.stringify({
+                        'type': 'FeatureCollection',
+                        'features': [
+                            {
+                                'type': 'Feature',
+                                'properties': {
+                                    'desc': 'You',
+                                    'owner': owner,
+                                },
+                                'geometry': {
+                                    'type': 'Point',
+                                    'coordinates': [loc.coords.longitude, loc.coords.latitude]
+                                }
+                            }
+                        ]
+                    }))
+                }, (err) => rej(err));
+            });
+        };
+
+        const connectWs = (url) => {
+            const ws = new WebSocket(url);
+
+            ws.onopen = () => {
+                console.log('Connected');
+                ws.send(JSON.stringify({
+                    topics: ['map']
+                }));
+            };
+
+            ws.onclose = () => {
+                console.log('Disconnected');
+            };
+
+            return ws;
+        };
+
+        const genUsername = () => {
+            const username = (Math.random() + 1).toString(36).substring(2);
+            return username;
+        }
+
+        const isDiffAcceptable = (x, y, threshold) => {
+            x = Number(x).toFixed(5);
+            y = Number(y).toFixed(5);
+            return Math.max(x, y) - Math.min(x, y) > threshold;
+        }
+
+        const register = async (username) => {
+            const response = await fetch('http://localhost:8080/register', {
+                ...defaultFetchConfig,
+                body: JSON.stringify({
+                    user_id: username,
+                }),
+            });
+
+            return response.json();
+        };
+
+        const publish = async (topic, message, sender, user = undefined) => {
+            const payload = {
+                topic: topic,
+                message: message,
+                sender_user_id: sender,
+            };
+
+            if (user) {
+                payload.user_id = user;
+            }
+
+            const response = await fetch('http://localhost:8080/publish', {
+                ...defaultFetchConfig,
+                body: JSON.stringify(payload),
+            });
+
+            return response.text();
+        };
+
+        const addToMap = (map, sender, data, iconMeta) => {
+            map.addSource(sender, {
+                type: 'geojson',
+                data: data,
+            });
+
+            map.addLayer({
+                'id': sender,
+                'type': 'symbol',
+                'source': sender,
+                'layout': {
+                    'text-field': ['get', 'desc'],
+                    'text-variable-anchor': ['top', 'bottom', 'left', 'right'],
+                    'text-radial-offset': 0.5,
+                    'text-justify': 'auto',
+                    'icon-image': iconMeta.icon,
+                    'icon-size': iconMeta.size,
+                }
+            });
+
+            map.on('mousemove', sender, (evt) => {
+                map.getCanvas().style.cursor = 'pointer';
+            });
+
+            map.on('mouseleave', sender, (evt) => {
+                map.getCanvas().style.cursor = '';
+            });
+
+            map.on('click', sender, (evt) => {
+                const props = evt.features[0].properties;
+                console.log(props);
+            });
+        }
+
+        const loadMarkerImages = async (map) => {
+            const sources = [
+                {
+                    location: 'marker-blue.png',
+                    name: 'user',
+                },
+                {
+                    location: 'marker-red.png',
+                    name: 'other',
+                },
+            ];
+
+            const loaders = [];
+
+            sources.forEach(source => {
+                loaders.push(new Promise((res, rej) => {
+                    map.loadImage(`http://localhost:5500/frontend/assets/${source.location}`, (err, image) => {
+                       if (err) rej(err);
+
+                       map.addImage(source.name, image);
+                       res();
+                    });
+                }));
+            });
+
+            await Promise.all(loaders);
+        };
+
+        mapboxgl.accessToken = '{MBX_ACCESS_TOKEN}';
+        const map = new mapboxgl.Map({
+            container: 'map',
+            style: 'mapbox://styles/mapbox/streets-v12',
+            zoom: 1.5,
+        });
+
+        let username = genUsername();
+
+        const usernameTextInput = document.querySelector('#username-input');
+        const usernameSetter = document.querySelector('#set-username-btn');
+
+        getUserLocation(username).then(async (loc) => {
+            await loadMarkerImages(map);
+
+            let socket = await register(username);
+            let ws = connectWs(socket.url);
+
+            map.on('load', async () => {
+                ws.onmessage = (evt) => {
+                    const data = JSON.parse(evt.data);
+                    if (data.event_type) {
+                        switch (data.event_type) {
+                            case 'disconnect':
+                                const id = `sender-${data.user_id}`;
+                                if (map.getLayer(id)) map.removeLayer(id);
+                                if (map.getSource(id)) map.removeSource(id);
+                                return;
+                            default:
+                                break;
+                        }
+                    }
+
+                    const senderUserID = data.sender_user_id;
+
+                    data.message = JSON.parse(data.message);
+                    data.message.features[0].properties.desc = senderUserID;
+                    data.message.features[0].properties.owner = senderUserID;
+
+                    const sender = `sender-${senderUserID}`;
+
+                    if (map.getLayer(sender) || map.getSource(sender)) {
+                        const [currLng, currLat] = map.querySourceFeatures(sender)[0].geometry.coordinates;
+                        const [newLng, newLat] = data.message.features[0].geometry.coordinates;
+
+                        if (isDiffAcceptable(currLng, newLng, 0.1) || isDiffAcceptable(currLat, newLat, 0.1)) {
+                            map.getSource(sender).setData(data.message);
+                        }
+
+                        return;
+                    }
+
+                    addToMap(map, sender, data.message, { icon: 'other', size: 0.055 });
+                }
+
+                addToMap(map, 'user', JSON.parse(loc), { icon: 'user', size: 0.040 });
+
+                setInterval(async () => {
+                    const userLoc = await getUserLocation(username);
+                    map.getSource('user').setData(JSON.parse(userLoc));
+
+                    await publish('map', userLoc, username);
+                }, 3000)
+            });
+
+            usernameSetter.addEventListener('click', async () => {
+                ws.close();
+
+                username = usernameTextInput.value;
+                const source = map.getSource('user');
+
+                const updatedData = source._data;
+                updatedData.features[0].properties.owner = username;
+
+                socket = await register(username);
+                ws = connectWs(socket.url);
+                source.setData(updatedData);
+
+                await publish('map', JSON.stringify(updatedData), username);
+            });
+        }).catch(err => {
+            console.error(err);
+        });
+    </script>
+</body>
+</html>
